@@ -1,5 +1,9 @@
 # rutonychat-wtv-script
 
+[![Release](https://img.shields.io/github/v/release/Mextrim/rutonychat-wtv-script?label=release&color=C4B5FD)](https://github.com/Mextrim/rutonychat-wtv-script/releases)
+[![License](https://img.shields.io/badge/license-MIT-7C5CFF.svg)](LICENSE)
+[![Для RutonyChat](https://img.shields.io/badge/RutonyChat-524660-C4B5FD.svg)](https://store.steampowered.com/app/524660/)
+
 Мост чата W.TV для [RutonyChat](https://store.steampowered.com/app/524660/).
 
 RutonyChat не умеет W.TV нативно: площадки нет ни в списке платформ, ни в
@@ -16,6 +20,9 @@ RutonyChat не умеет W.TV нативно: площадки нет ни в 
 ---
 
 ## Установка
+
+**[⬇ Скачать wtv-script-1.0.0.zip](https://github.com/Mextrim/rutonychat-wtv-script/releases/download/v1.0.0/wtv-script-1.0.0.zip)** ·
+[все релизы](https://github.com/Mextrim/rutonychat-wtv-script/releases)
 
 1. Скопируйте `wtv.cs` в `<RutonyChat>/scripts/`
 2. **Автономные скрипты → wtv → Параметры:**
