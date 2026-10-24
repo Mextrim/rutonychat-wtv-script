@@ -78,6 +78,10 @@ namespace RutonyChat {
         private const string CHAT_API = "https://chats-service.w.tv/api/v1";
         private const string ORIGIN = "https://w.tv";
         private const string UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+        // Per-request timeout so a hung request cannot block the whole worker.
+        private const int REQUEST_TIMEOUT_SEC = 15;
+        // Max consecutive failures before resetting the HttpClient.
+        private const int MAX_FAILS_BEFORE_RESET = 5;
 
         private string nickname = DEFAULT_NICKNAME;
 
@@ -97,6 +101,9 @@ namespace RutonyChat {
         private readonly Queue<string[]> pending = new Queue<string[]>();
         private int pendingCount;
 
+        // failure counter used to recycle the HttpClient after repeated errors.
+        private int failCount;
+
         // ---------------------------------------------------------------------
         //  RutonyChat lifecycle
         // ---------------------------------------------------------------------
@@ -113,6 +120,7 @@ namespace RutonyChat {
             Stop();
             lock (pending) { pending.Clear(); pendingCount = 0; }
             lock (seen) { seen.Clear(); seenOrder.Clear(); }
+            failCount = 0;
 
             running = true;
             cts = new CancellationTokenSource();
@@ -215,13 +223,15 @@ namespace RutonyChat {
             req.Content = new StringContent(payload.ToString(Newtonsoft.Json.Formatting.None),
                                             Encoding.UTF8, "application/json");
 
-            var resp = await http.SendAsync(req).ConfigureAwait(false);
-            var res = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+            using (var ctsReq = new CancellationTokenSource(TimeSpan.FromSeconds(REQUEST_TIMEOUT_SEC))) {
+                var resp = await http.SendAsync(req, ctsReq.Token).ConfigureAwait(false);
+                var res = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
 
-            if (resp.IsSuccessStatusCode) {
-                Log("sent: " + Truncate(message, 60));
-            } else {
-                Log("!! send HTTP " + (int)resp.StatusCode + ": " + Truncate(res, 160));
+                if (resp.IsSuccessStatusCode) {
+                    Log("sent: " + Truncate(message, 60));
+                } else {
+                    Log("!! send HTTP " + (int)resp.StatusCode + ": " + Truncate(res, 160));
+                }
             }
         }
 
@@ -241,6 +251,7 @@ namespace RutonyChat {
                         await PrimeSeenAsync(token);
                         ready = true;
                         attempt = 0;
+                        failCount = 0;
                     }
 
                     await PollOnceAsync(token);
@@ -250,8 +261,16 @@ namespace RutonyChat {
                 } catch (OperationCanceledException) {
                     break;
                 } catch (Exception ex) {
+                    failCount++;
                     Log("!! " + ex.GetType().Name + ": " + ex.Message);
-                    ready = false;
+                    // Recycle HttpClient after repeated failures so stale
+                    // connections / DNS state do not keep breaking requests.
+                    if (failCount >= MAX_FAILS_BEFORE_RESET) {
+                        try { http?.CancelPendingRequests(); } catch { }
+                        http = null;
+                        ready = false;
+                        failCount = 0;
+                    }
                     attempt++;
                     var waitMs = Math.Min(30000, 1500 * Math.Min(20, attempt));
                     try { await Task.Delay(waitMs, token); } catch { break; }
@@ -262,13 +281,18 @@ namespace RutonyChat {
         }
 
         private static HttpClient NewHttp() {
-            var h = new HttpClient(new HttpClientHandler {
+            var handler = new HttpClientHandler {
                 CookieContainer = new CookieContainer(),
                 UseCookies = true,
                 AllowAutoRedirect = true,
                 AutomaticDecompression = System.Net.DecompressionMethods.GZip |
-                                         System.Net.DecompressionMethods.Deflate
-            });
+                                         System.Net.DecompressionMethods.Deflate,
+                // Do not throw on non-success status codes; we inspect them manually.
+                UseDefaultCredentials = false,
+            };
+            var h = new HttpClient(handler) {
+                Timeout = TimeSpan.FromSeconds(REQUEST_TIMEOUT_SEC),
+            };
             h.DefaultRequestHeaders.UserAgent.ParseAdd(UA);
             h.DefaultRequestHeaders.Add("Origin", ORIGIN);
             h.DefaultRequestHeaders.Add("Referer", ORIGIN + "/");
@@ -281,22 +305,26 @@ namespace RutonyChat {
                                    PROFILE_API, Uri.EscapeDataString(nickname));
             Log("resolving " + url);
 
-            var json = await http.GetStringAsync(url).ConfigureAwait(false);
-            var root = JObject.Parse(json);
+            using (var ctsReq = new CancellationTokenSource(TimeSpan.FromSeconds(REQUEST_TIMEOUT_SEC))) {
+                var json = await http.GetStringAsync(url, ctsReq.Token).ConfigureAwait(false);
+                var root = JObject.Parse(json);
 
-            chatId = (string)root["profile"]?["userId"];
-            if (string.IsNullOrEmpty(chatId))
-                throw new Exception("no userId for nickname '" + nickname + "'");
+                chatId = (string)root["profile"]?["userId"];
+                if (string.IsNullOrEmpty(chatId))
+                    throw new Exception("no userId for nickname '" + nickname + "'");
 
-            Log("chatId : " + chatId);
+                Log("chatId : " + chatId);
+            }
         }
 
         // 2) one poll of the public message list (read-only, no join, no subscribe)
         private async Task PollOnceAsync(CancellationToken token) {
             var url = string.Format("{0}/chats/{1}/messages?limit={2}&platform=web",
                                    CHAT_API, chatId, PAGE_LIMIT);
-            var json = await http.GetStringAsync(url).ConfigureAwait(false);
-            HandleMessages(json);
+            using (var ctsReq = new CancellationTokenSource(TimeSpan.FromSeconds(REQUEST_TIMEOUT_SEC))) {
+                var json = await http.GetStringAsync(url, ctsReq.Token).ConfigureAwait(false);
+                HandleMessages(json);
+            }
         }
 
         private async Task PrimeSeenAsync(CancellationToken token) {
@@ -304,20 +332,22 @@ namespace RutonyChat {
                                    CHAT_API, chatId, PAGE_LIMIT);
             try
             {
-                var json = await http.GetStringAsync(url).ConfigureAwait(false);
-                var root = JObject.Parse(json);
-                var arr = (JArray)root["messages"];
-                if (arr != null)
-                {
-                    lock (seen)
+                using (var ctsReq = new CancellationTokenSource(TimeSpan.FromSeconds(REQUEST_TIMEOUT_SEC))) {
+                    var json = await http.GetStringAsync(url, ctsReq.Token).ConfigureAwait(false);
+                    var root = JObject.Parse(json);
+                    var arr = (JArray)root["messages"];
+                    if (arr != null)
                     {
-                        foreach (var m in arr)
+                        lock (seen)
                         {
-                            var id = (string)m["messageId"];
-                            if (!string.IsNullOrEmpty(id)) Remember(id);
+                            foreach (var m in arr)
+                            {
+                                var id = (string)m["messageId"];
+                                if (!string.IsNullOrEmpty(id)) Remember(id);
+                            }
                         }
+                        Log("primed with " + arr.Count + " existing messages");
                     }
-                    Log("primed with " + arr.Count + " existing messages");
                 }
             }
             catch (Exception ex) { Log("prime failed: " + ex.Message); }
